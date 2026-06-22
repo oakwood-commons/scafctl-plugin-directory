@@ -45,6 +45,8 @@ func TestGetProviderDescriptor(t *testing.T) {
 	assert.Contains(t, desc.Schema.Properties, "excludeHidden")
 	assert.Contains(t, desc.Schema.Properties, "filesOnly")
 	assert.Contains(t, desc.Schema.Properties, "checksum")
+	assert.Contains(t, desc.Schema.Properties, "relativeTo")
+	assert.Equal(t, []any{"auto", "solution", "cwd"}, desc.Schema.Properties["relativeTo"].Enum)
 	assert.NotNil(t, desc.OutputSchemas[sdkprovider.CapabilityFrom])
 	assert.NotNil(t, desc.OutputSchemas[sdkprovider.CapabilityAction])
 	assert.NotEmpty(t, desc.Examples)
@@ -763,6 +765,32 @@ func TestCopy_Success(t *testing.T) {
 	assert.Equal(t, "nested", string(content))
 }
 
+func TestCopy_RelativeTo_Solution_ResolvesDestination(t *testing.T) {
+	p := NewPlugin()
+	dir := t.TempDir()
+
+	srcDir := filepath.Join(dir, "source")
+	require.NoError(t, os.MkdirAll(srcDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "file.txt"), []byte("content"), 0o600))
+
+	// With relativeTo: solution, a relative destination anchors to the working
+	// directory (which the host sets to the solution directory).
+	ctx := sdkprovider.WithWorkingDirectory(context.Background(), dir)
+	result, err := p.ExecuteProvider(ctx, "directory", map[string]any{
+		"operation":   "copy",
+		"path":        srcDir,
+		"destination": "destination",
+		"relativeTo":  "solution",
+	})
+	require.NoError(t, err)
+	data := result.Data.(map[string]any)
+	assert.Equal(t, filepath.Join(dir, "destination"), data["destination"])
+
+	content, err := os.ReadFile(filepath.Join(dir, "destination", "file.txt")) //nolint:gosec // dir is a temp directory
+	require.NoError(t, err)
+	assert.Equal(t, "content", string(content))
+}
+
 func TestCopy_MissingDestination(t *testing.T) {
 	p := NewPlugin()
 	dir := t.TempDir()
@@ -1212,4 +1240,106 @@ func TestResolvePath_OutputDirContainment(t *testing.T) {
 	_, err := resolvePath(ctx, "../../../etc/passwd")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "resolves outside output directory")
+}
+
+func TestResolvePathRel_Absolute(t *testing.T) {
+	ctx := sdkprovider.WithWorkingDirectory(context.Background(), "/work")
+	for _, relativeTo := range []string{"auto", "solution", "cwd", ""} {
+		result, err := resolvePathRel(ctx, "/absolute/path", relativeTo)
+		require.NoError(t, err)
+		assert.Equal(t, "/absolute/path", result, "relativeTo=%q", relativeTo)
+	}
+}
+
+func TestResolvePathRel_Solution_AnchorContextWorkingDirectory(t *testing.T) {
+	ctx := sdkprovider.WithWorkingDirectory(context.Background(), "/work")
+	result, err := resolvePathRel(ctx, "relative/path", "solution")
+	require.NoError(t, err)
+	assert.Equal(t, "/work/relative/path", result)
+}
+
+func TestResolvePathRel_Cwd_AnchorProcessWorkingDirectory(t *testing.T) {
+	origDir, err := os.Getwd()
+	require.NoError(t, err)
+
+	tmpDir := t.TempDir()
+	require.NoError(t, os.Chdir(tmpDir))
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	// Read back the resolved CWD to handle symlinks (e.g. /var → /private/var on macOS).
+	resolvedCwd, err := os.Getwd()
+	require.NoError(t, err)
+
+	// No context working directory set — cwd must use the process CWD, not the context.
+	ctx := context.Background()
+	result, err := resolvePathRel(ctx, "relative/path", "cwd")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Clean(filepath.Join(resolvedCwd, "relative/path")), result)
+}
+
+func TestResolvePathRel_AutoDelegatesToResolvePath(t *testing.T) {
+	ctx := context.Background()
+	ctx = sdkprovider.WithExecutionMode(ctx, sdkprovider.CapabilityAction)
+	ctx = sdkprovider.WithOutputDirectory(ctx, "/tmp/output")
+
+	// In action mode with an output directory, auto anchors to the output dir.
+	result, err := resolvePathRel(ctx, "sub/dir", "auto")
+	require.NoError(t, err)
+	assert.Equal(t, "/tmp/output/sub/dir", result)
+}
+
+func TestResolvePathRel_Solution_ActionMode_OutputDirContainment(t *testing.T) {
+	ctx := context.Background()
+	ctx = sdkprovider.WithExecutionMode(ctx, sdkprovider.CapabilityAction)
+	ctx = sdkprovider.WithWorkingDirectory(ctx, "/tmp/output")
+	ctx = sdkprovider.WithOutputDirectory(ctx, "/tmp/output")
+
+	_, err := resolvePathRel(ctx, "../../../etc/passwd", "solution")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resolves outside output directory")
+}
+
+func TestResolvePathRel_Cwd_ActionMode_OutputDirContainment(t *testing.T) {
+	outputDir := t.TempDir()
+
+	origDir, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(outputDir))
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	ctx := context.Background()
+	ctx = sdkprovider.WithExecutionMode(ctx, sdkprovider.CapabilityAction)
+	ctx = sdkprovider.WithOutputDirectory(ctx, outputDir)
+
+	_, err = resolvePathRel(ctx, "../../../etc/passwd", "cwd")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resolves outside output directory")
+}
+
+func TestResolvePathRel_Unknown_ReturnsError(t *testing.T) {
+	ctx := context.Background()
+	_, err := resolvePathRel(ctx, "relative/path", "unknown-value")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported relativeTo value")
+}
+
+func TestResolvePathRel_Unknown_AbsolutePath_ReturnsError(t *testing.T) {
+	// An invalid relativeTo must be rejected even when path is absolute,
+	// ensuring validation runs before the absolute-path fast-path.
+	ctx := context.Background()
+	_, err := resolvePathRel(ctx, "/absolute/path", "unknown-value")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported relativeTo value")
+}
+
+func TestResolvePathRel_Solution_BypassesOutputDirAnchor(t *testing.T) {
+	// solution anchors to the context working directory even in action mode,
+	// rather than joining onto the output directory like auto does.
+	ctx := context.Background()
+	ctx = sdkprovider.WithExecutionMode(ctx, sdkprovider.CapabilityAction)
+	ctx = sdkprovider.WithWorkingDirectory(ctx, "/work")
+
+	result, err := resolvePathRel(ctx, "relative/path", "solution")
+	require.NoError(t, err)
+	assert.Equal(t, "/work/relative/path", result)
 }

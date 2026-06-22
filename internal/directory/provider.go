@@ -105,6 +105,20 @@ func buildDescriptor() *sdkprovider.Descriptor {
 				schemahelper.WithDefault(false)),
 			"force": schemahelper.BoolProp("Force removal of non-empty directories for rmdir",
 				schemahelper.WithDefault(false)),
+			"relativeTo": schemahelper.StringProp(
+				"Base directory anchor for resolving relative path and destination inputs. "+
+					"solution: resolve relative to the solution directory. During the resolver phase the "+
+					"host sets the working directory to the solution directory, so this anchors near the "+
+					"solution file regardless of where the CLI is invoked from. "+
+					"cwd: resolve relative to the process working directory. "+
+					"auto (default): uses the output directory as the anchor in action mode when set (with "+
+					"containment validation); otherwise the working directory. "+
+					"Note: solution and cwd anchors enforce output-directory containment when an output "+
+					"directory is set. In action mode the solution anchor resolves against the working "+
+					"directory, which equals the solution directory only during the resolver phase.",
+				schemahelper.WithExample("solution"),
+				schemahelper.WithDefault("auto"),
+				schemahelper.WithEnum("auto", "solution", "cwd")),
 		}),
 		OutputSchemas: map[sdkprovider.Capability]*jsonschema.Schema{
 			sdkprovider.CapabilityFrom: schemahelper.ObjectSchema(nil, map[string]*jsonschema.Schema{
@@ -254,7 +268,9 @@ func (p *Plugin) ExecuteProvider(ctx context.Context, providerName string, input
 		return nil, fmt.Errorf("%s: path is required and must be a string", ProviderName)
 	}
 
-	absPath, err := resolvePath(ctx, path)
+	relativeTo, _ := inputs["relativeTo"].(string)
+
+	absPath, err := resolvePathRel(ctx, path, relativeTo)
 	if err != nil {
 		return nil, fmt.Errorf("%s: invalid path: %w", ProviderName, err)
 	}
@@ -334,6 +350,75 @@ func (p *Plugin) ExtractDependencies(_ context.Context, _ string, _ map[string]a
 // StopProvider is a no-op for the directory provider.
 func (p *Plugin) StopProvider(_ context.Context, _ string) error {
 	return nil
+}
+
+// resolvePathRel resolves a filesystem path according to the relativeTo anchor,
+// mirroring the builtin file provider's semantics within the plugin SDK's
+// capabilities.
+//
+//   - "solution": anchor to the working directory from context (falling back to
+//     filepath.Abs). The host sets the working directory to the solution
+//     directory during the resolver phase, so this resolves near the solution
+//     file. In action mode the working directory is the process working
+//     directory, not the solution directory; the plugin SDK does not expose a
+//     separate solution-directory anchor, so this is the closest available
+//     behavior.
+//   - "cwd": anchor to the process working directory (os.Getwd()).
+//   - "auto" or "": delegate to resolvePath, which uses the output directory as
+//     the anchor in action mode when set, otherwise the working directory.
+//
+// For "solution" and "cwd", when in action mode with an output directory set,
+// the resolved path is validated to ensure it does not escape that directory,
+// preserving the containment guarantee that resolvePath provides for "auto".
+// An unsupported relativeTo value always returns an error, even when path is absolute.
+func resolvePathRel(ctx context.Context, path, relativeTo string) (string, error) {
+	switch relativeTo {
+	case "solution", "cwd", "auto", "":
+		// valid values — handled below
+	default:
+		return "", fmt.Errorf("unsupported relativeTo value %q: must be one of \"auto\", \"solution\", or \"cwd\"", relativeTo)
+	}
+
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+
+	switch relativeTo {
+	case "solution":
+		resolved, err := absFromContext(ctx, path)
+		if err != nil {
+			return "", err
+		}
+		resolved = filepath.Clean(resolved)
+
+		if mode, modeOK := sdkprovider.ExecutionModeFromContext(ctx); modeOK && mode == sdkprovider.CapabilityAction {
+			if outputDir, dirOK := sdkprovider.OutputDirectoryFromContext(ctx); dirOK && outputDir != "" {
+				if err := validatePathContainment(outputDir, resolved); err != nil {
+					return "", fmt.Errorf("path %q resolves outside output directory %q: %w", path, outputDir, err)
+				}
+			}
+		}
+		return resolved, nil
+
+	case "cwd":
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("getting process working directory: %w", err)
+		}
+		resolved := filepath.Clean(filepath.Join(cwd, path))
+
+		if mode, modeOK := sdkprovider.ExecutionModeFromContext(ctx); modeOK && mode == sdkprovider.CapabilityAction {
+			if outputDir, dirOK := sdkprovider.OutputDirectoryFromContext(ctx); dirOK && outputDir != "" {
+				if err := validatePathContainment(outputDir, resolved); err != nil {
+					return "", fmt.Errorf("path %q resolves outside output directory %q: %w", path, outputDir, err)
+				}
+			}
+		}
+		return resolved, nil
+
+	default: // "auto" or ""
+		return resolvePath(ctx, path)
+	}
 }
 
 // resolvePath resolves a filesystem path based on the current execution context.
@@ -851,7 +936,8 @@ func (p *Plugin) executeCopy(ctx context.Context, absPath string, inputs map[str
 		return nil, fmt.Errorf("destination is required for copy operation")
 	}
 
-	absDest, err := resolvePath(ctx, destination)
+	relativeTo, _ := inputs["relativeTo"].(string)
+	absDest, err := resolvePathRel(ctx, destination, relativeTo)
 	if err != nil {
 		return nil, fmt.Errorf("invalid destination path: %w", err)
 	}
@@ -888,7 +974,8 @@ func (p *Plugin) executeMove(ctx context.Context, absPath string, inputs map[str
 		return nil, fmt.Errorf("destination is required for move operation")
 	}
 
-	absDest, err := resolvePath(ctx, destination)
+	relativeTo, _ := inputs["relativeTo"].(string)
+	absDest, err := resolvePathRel(ctx, destination, relativeTo)
 	if err != nil {
 		return nil, fmt.Errorf("invalid destination path: %w", err)
 	}
@@ -1053,7 +1140,8 @@ func (p *Plugin) executeDryRun(ctx context.Context, operation, absPath string, i
 		if !ok || destination == "" {
 			return nil, fmt.Errorf("destination is required for copy operation")
 		}
-		absDest, err := resolvePath(ctx, destination)
+		relativeTo, _ := inputs["relativeTo"].(string)
+		absDest, err := resolvePathRel(ctx, destination, relativeTo)
 		if err != nil {
 			return nil, fmt.Errorf("resolving copy destination: %w", err)
 		}
@@ -1073,7 +1161,8 @@ func (p *Plugin) executeDryRun(ctx context.Context, operation, absPath string, i
 		if !ok || destination == "" {
 			return nil, fmt.Errorf("destination is required for move operation")
 		}
-		absDest, err := resolvePath(ctx, destination)
+		relativeTo, _ := inputs["relativeTo"].(string)
+		absDest, err := resolvePathRel(ctx, destination, relativeTo)
 		if err != nil {
 			return nil, fmt.Errorf("resolving move destination: %w", err)
 		}
