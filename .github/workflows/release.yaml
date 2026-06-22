@@ -70,7 +70,8 @@ jobs:
       - name: Login to GitHub Container Registry
         run: |
           mkdir -p ~/.docker
-          echo '{"auths":{"ghcr.io":{"auth":"'"$(echo -n "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64)"'"}}}' > ~/.docker/config.json
+          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
 
       - name: Download release archives
         env:
@@ -109,10 +110,11 @@ jobs:
           VERSION="${GITHUB_REF#refs/tags/v}"
           BINARY="scafctl-plugin-directory"
           NAME="directory"
-          CATALOG="ghcr.io/oakwood-commons"
-          IMAGE="${CATALOG}/providers/${NAME}"
+          CATALOG="oci://ghcr.io/${{ github.repository_owner }}"
+          IMAGE="ghcr.io/${{ github.repository_owner }}/providers/${NAME}"
 
           scafctl build plugin \
+            --force \
             --name "${NAME}" \
             --kind "provider" \
             --version "${VERSION}" \
@@ -131,6 +133,11 @@ jobs:
           # Resolve the pushed manifest digest for cosign signing
           DIGEST=$(crane digest "${IMAGE}:${VERSION}")
           echo "image_ref=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh catalog index
+        run: |
+          scafctl catalog index push \
+            --catalog "oci://ghcr.io/${{ github.repository_owner }}"
 
   sign:
     name: Sign OCI Artifact
