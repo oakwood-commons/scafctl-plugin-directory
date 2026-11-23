@@ -1,5 +1,9 @@
 # scafctl-plugin-directory - AI Agent Instructions
 
+<!-- copilot-review:start -->
+For pull request code review, follow the review contract in [`REVIEW.md`](../REVIEW.md) at the repo root. It is the single source of truth; do not duplicate it here.
+<!-- copilot-review:end -->
+
 ## Overview
 
 scafctl provider plugin implementing the **directory** provider.
